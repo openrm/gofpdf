@@ -25,6 +25,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"compress/zlib"
+	"crypto/sha1"
 	"fmt"
 	"image"
 	"image/color"
@@ -690,6 +692,13 @@ func (f *Fpdf) Close() {
 	f.endpage()
 	// Close document
 	f.enddoc()
+
+	for name := range f.images {
+		if f.images[name].Close != nil {
+			f.images[name].Close()
+		}
+	}
+
 	return
 }
 
@@ -3117,6 +3126,12 @@ func (f *Fpdf) ImageOptions(imageNameStr string, x, y, w, h float64, flow bool, 
 	if f.err != nil {
 		return
 	}
+	if info.buf == nil {
+		if err := info.load(); err != nil {
+			f.err = err
+			return
+		}
+	}
 	f.imageOut(info, x, y, w, h, options.AllowNegativePosition, flow, link, linkStr)
 	return
 }
@@ -3179,6 +3194,10 @@ func (f *Fpdf) RegisterImageOptionsReader(imgName string, options ImageOptions, 
 	if options.ImageType == "jpeg" {
 		options.ImageType = "jpg"
 	}
+
+	hash := sha1.New()
+	r = io.TeeReader(r, hash)
+
 	switch options.ImageType {
 	case "jpg":
 		info = f.parsejpg(r)
@@ -3193,9 +3212,7 @@ func (f *Fpdf) RegisterImageOptionsReader(imgName string, options ImageOptions, 
 		return
 	}
 
-	if info.i, f.err = generateImageID(info); f.err != nil {
-		return
-	}
+	info.hash = hash
 	f.images[imgName] = info
 
 	return
@@ -3213,7 +3230,8 @@ func (f *Fpdf) RegisterImage(fileStr, tp string) (info *ImageInfoType) {
 		ReadDpi:   false,
 		ImageType: tp,
 	}
-	return f.RegisterImageOptions(fileStr, options)
+	info = f.RegisterImageOptions(fileStr, options)
+	return
 }
 
 // RegisterImageOptions registers an image, adding it to the PDF file but not
@@ -3232,7 +3250,6 @@ func (f *Fpdf) RegisterImageOptions(fileStr string, options ImageOptions) (info 
 		f.err = err
 		return
 	}
-	defer file.Close()
 
 	// First use of this image, get info
 	if options.ImageType == "" {
@@ -3244,7 +3261,15 @@ func (f *Fpdf) RegisterImageOptions(fileStr string, options ImageOptions) (info 
 		options.ImageType = fileStr[pos+1:]
 	}
 
-	return f.RegisterImageOptionsReader(fileStr, options, file)
+	info = f.RegisterImageOptionsReader(fileStr, options, file)
+
+	info.addCloseHook(file.Close)
+
+	if f.err != nil {
+		return
+	}
+
+	return info
 }
 
 // GetImageInfo returns information about the registered image specified by
@@ -3649,18 +3674,13 @@ func (f *Fpdf) newImageInfo() *ImageInfoType {
 // Thank you, Bruno Michel, for providing this code.
 func (f *Fpdf) parsejpg(r io.Reader) (info *ImageInfoType) {
 	info = f.newImageInfo()
-	var (
-		data bytes.Buffer
-		err  error
-	)
-	_, err = data.ReadFrom(r)
-	if err != nil {
+	var buf [4096]byte
+	_, err := io.ReadFull(r, buf[:])
+	if err != nil && err != io.ErrUnexpectedEOF {
 		f.err = err
 		return
 	}
-	info.data = data.Bytes()
-
-	config, err := jpeg.DecodeConfig(bytes.NewReader(info.data))
+	config, err := jpeg.DecodeConfig(bytes.NewReader(buf[:]))
 	if err != nil {
 		f.err = err
 		return
@@ -3680,17 +3700,13 @@ func (f *Fpdf) parsejpg(r io.Reader) (info *ImageInfoType) {
 		f.err = fmt.Errorf("image JPEG buffer has unsupported color space (%v)", config.ColorModel)
 		return
 	}
+	info.r = io.MultiReader(bytes.NewReader(buf[:]), r)
 	return
 }
 
 // parsepng extracts info from a PNG data
 func (f *Fpdf) parsepng(r io.Reader, readdpi bool) (info *ImageInfoType) {
-	buf, err := bufferFromReader(r)
-	if err != nil {
-		f.err = err
-		return
-	}
-	return f.parsepngstream(buf, readdpi)
+	return f.parsepngstream(r, readdpi)
 }
 
 func (f *Fpdf) readBeInt32(r io.Reader) (val int32) {
@@ -3742,13 +3758,24 @@ func (f *Fpdf) newobj() {
 	f.outf("%d 0 obj", f.n)
 }
 
+func (f *Fpdf) putstreambuf(buf *bytes.Buffer) {
+	// dbg("putstreambuf")
+	if f.protect.encrypted {
+		b := buf.Bytes()
+		f.protect.rc4(uint32(f.n), &b)
+	}
+	f.out("stream")
+	f.outbuf(buf)
+	f.out("endstream")
+}
+
 func (f *Fpdf) putstream(b []byte) {
 	// dbg("putstream")
 	if f.protect.encrypted {
 		f.protect.rc4(uint32(f.n), &b)
 	}
 	f.out("stream")
-	f.out(string(b))
+	f.outbytes(b)
 	f.out("endstream")
 }
 
@@ -3759,6 +3786,17 @@ func (f *Fpdf) out(s string) {
 		f.pages[f.page].WriteString("\n")
 	} else {
 		f.buffer.WriteString(s)
+		f.buffer.WriteString("\n")
+	}
+}
+
+// outbytes adds a byte sequence to the document
+func (f *Fpdf) outbytes(b []byte) {
+	if f.state == 2 {
+		f.pages[f.page].Write(b)
+		f.pages[f.page].WriteString("\n")
+	} else {
+		f.buffer.Write(b)
 		f.buffer.WriteString("\n")
 	}
 }
@@ -3941,12 +3979,25 @@ func (f *Fpdf) putpages() {
 		// Page content
 		f.newobj()
 		if f.compress {
-			data := sliceCompress(f.pages[n].Bytes())
-			f.outf("<</Filter /FlateDecode /Length %d>>", len(data))
-			f.putstream(data)
+			buf := new(bytes.Buffer)
+			var (
+				w *zlib.Writer
+				err error
+			)
+			if w, err = zlib.NewWriterLevel(buf, zlib.BestSpeed); err != nil {
+				f.err = err
+				return
+			}
+			defer w.Close()
+			if _, err := io.Copy(w, f.pages[n]); err != nil {
+				f.err = err
+				return
+			}
+			f.outf("<</Filter /FlateDecode /Length %d>>", buf.Len())
+			f.putstreambuf(buf)
 		} else {
 			f.outf("<</Length %d>>", f.pages[n].Len())
-			f.putstream(f.pages[n].Bytes())
+			f.putstreambuf(f.pages[n])
 		}
 		f.out("endobj")
 	}
@@ -4375,6 +4426,9 @@ func (f *Fpdf) putimages() {
 }
 
 func (f *Fpdf) putimage(info *ImageInfoType) {
+	if info.Close != nil {
+		defer info.Close()
+	}
 	f.newobj()
 	info.n = f.n
 	f.out("<</Type /XObject")
@@ -4406,11 +4460,11 @@ func (f *Fpdf) putimage(info *ImageInfoType) {
 	if info.smask != nil {
 		f.outf("/SMask %d 0 R", f.n+1)
 	}
-	f.outf("/Length %d>>", len(info.data))
-	f.putstream(info.data)
+	f.outf("/Length %d>>", info.buf.Len())
+	f.putstreambuf(info.buf)
 	f.out("endobj")
 	// 	Soft mask
-	if len(info.smask) > 0 {
+	if info.smask != nil {
 		smask := &ImageInfoType{
 			w:     info.w,
 			h:     info.h,
@@ -4418,7 +4472,7 @@ func (f *Fpdf) putimage(info *ImageInfoType) {
 			bpc:   8,
 			f:     info.f,
 			dp:    sprintf("/Predictor 15 /Colors 1 /BitsPerComponent 8 /Columns %d", int(info.w)),
-			data:  info.smask,
+			buf:   info.smask,
 			scale: f.k,
 		}
 		f.putimage(smask)

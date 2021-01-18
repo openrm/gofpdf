@@ -877,11 +877,11 @@ func ExampleFpdf_RegisterImageOptionsReader() {
 		opt.ImageType = "png"
 		opt.AllowNegativePosition = true
 		_ = pdf.RegisterImageOptionsReader("logo", opt, fl)
-		fl.Close()
 		for x := -20.0; x <= 40.0; x += 5 {
 			pdf.ImageOptions("logo", x, x+30, 0, 0, false, opt, 0, "")
 		}
 		err = pdf.OutputFileAndClose(pdfStr)
+		fl.Close()
 	}
 	example.Summary(err, pdfStr)
 	// Output:
