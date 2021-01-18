@@ -81,6 +81,40 @@ func slicesEqual(a, b []float64) bool {
 	return true
 }
 
+type compressor struct {
+	e *zlib.Writer
+	b *bytes.Buffer
+	r io.Reader
+}
+
+func newCompressor(r io.Reader) *compressor {
+	b := new(bytes.Buffer)
+	e, _ := zlib.NewWriterLevel(b, zlib.BestSpeed)
+	return &compressor{e: e, b: b, r: r}
+}
+
+func (c *compressor) Read(buf []byte) (n int, err error) {
+	for c.b.Len() == 0 {
+		if n, err = c.r.Read(buf); err != nil {
+			return
+		}
+		if n, err = c.e.Write(buf[:n]); err != nil {
+			return
+		}
+		c.e.Flush()
+	}
+	n = min(c.b.Len(), len(buf))
+	copy(buf, c.b.Bytes()[:n])
+	copy(c.b.Bytes()[:c.b.Len() - n], c.b.Bytes()[n:])
+	c.b.Truncate(c.b.Len() - n)
+	return
+}
+
+func (c *compressor) Close() error {
+	c.b.Reset()
+	return c.e.Close()
+}
+
 // sliceCompress returns a zlib-compressed copy of the specified byte array
 func sliceCompress(data []byte) []byte {
 	var buf bytes.Buffer
